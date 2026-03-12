@@ -11,17 +11,16 @@
 /**
  * OpenAI-compatible API client.
  *
- * Covers: OpenAI (GPT-4o, GPT-4.1, o3, o4-mini), DeepSeek, Mistral, xAI (Grok),
+ * Covers: OpenAI (GPT-5.x, GPT-4.1, o3, o4-mini), DeepSeek, Mistral, xAI (Grok),
  *         OpenRouter, Ollama, LM Studio, and any custom OpenAI-compatible endpoint.
  *
- * Wire format: POST /v1/chat/completions (OpenAI Chat Completions API).
+ * Wire format:
+ *   - OpenAI native: POST /v1/responses (Responses API) — required for GPT-5.x + tools
+ *   - All others:    POST /v1/chat/completions (Chat Completions API)
+ *
  * SSE streaming: "data: {json}" events, terminated by "data: [DONE]".
  *
- * Reasoning models (o3, o4-mini, deepseek-reasoner):
- *   - Set reasoning_effort field to "low"/"medium"/"high" instead of temperature
- *   - DeepSeek-R1 uses <think>...</think> tags in content stream
- *
- * Adapted from Roo Code's AnthropicHandler → OpenAI-compatible path.
+ * Adapted from Roo Code's openai-native.ts (Responses API) + base-openai-compatible-provider.ts
  */
 class AUTONOMIXLLM_API FAutonomixOpenAICompatClient : public IAutonomixLLMClient
 {
@@ -62,8 +61,17 @@ public:
 	const FAutonomixTokenUsage& GetLastTokenUsage() const { return LastTokenUsage; }
 
 private:
-	/** Build the POST /v1/chat/completions request body */
+	/** Build the request body — dispatches to Responses API or Chat Completions based on bUseResponsesAPI */
 	TSharedPtr<FJsonObject> BuildRequestBody(
+		const TArray<FAutonomixMessage>& History,
+		const FString& SystemPrompt,
+		const TArray<TSharedPtr<FJsonObject>>& ToolSchemas
+	) const;
+
+	// ---- Chat Completions API (legacy providers) ----
+
+	/** Build POST /v1/chat/completions request body */
+	TSharedPtr<FJsonObject> BuildChatCompletionsBody(
 		const TArray<FAutonomixMessage>& History,
 		const FString& SystemPrompt,
 		const TArray<TSharedPtr<FJsonObject>>& ToolSchemas
@@ -75,10 +83,27 @@ private:
 		const FString& SystemPrompt
 	) const;
 
-	/** Convert Autonomix tool schemas to OpenAI tools array */
+	/** Convert Autonomix tool schemas to OpenAI Chat Completions tools format */
 	TArray<TSharedPtr<FJsonValue>> ConvertToolSchemas(
 		const TArray<TSharedPtr<FJsonObject>>& ToolSchemas
 	) const;
+
+	// ---- Responses API (OpenAI native, GPT-5.x) ----
+
+	/** Build POST /v1/responses request body (Roo Code openai-native.ts) */
+	TSharedPtr<FJsonObject> BuildResponsesAPIBody(
+		const TArray<FAutonomixMessage>& History,
+		const FString& SystemPrompt,
+		const TArray<TSharedPtr<FJsonObject>>& ToolSchemas
+	) const;
+
+	/** Convert history to Responses API input array format */
+	TArray<TSharedPtr<FJsonValue>> ConvertToResponsesInput(
+		const TArray<FAutonomixMessage>& Messages
+	) const;
+
+	/** Process a Responses API SSE event (different event types from Chat Completions) */
+	void ProcessResponsesSSEEvent(const FString& DataJson);
 
 	/** Convert EAutonomixReasoningEffort to API string ("low"/"medium"/"high") */
 	static FString ReasoningEffortToString(EAutonomixReasoningEffort Effort);
@@ -105,6 +130,7 @@ private:
 	int32 MaxTokens;
 	EAutonomixReasoningEffort ReasoningEffort;
 	bool bStreamingEnabled;
+	bool bUseResponsesAPI = false;  // Set per-request: true for OpenAI native (Responses API)
 
 	// Request state
 	TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> CurrentRequest;

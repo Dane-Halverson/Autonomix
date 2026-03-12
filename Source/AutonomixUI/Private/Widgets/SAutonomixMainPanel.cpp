@@ -1301,17 +1301,20 @@ bool SAutonomixMainPanel::CheckPrivacyDisclosure()
 		return true; // Already accepted
 	}
 
-	// Show mandatory first-launch privacy disclosure
+	// Show mandatory first-launch privacy disclosure — provider-agnostic.
+	// Autonomix supports 10+ providers; the disclosure must be generic.
+	FString ProviderName = FAutonomixLLMClientFactory::GetActiveProviderDisplayName();
 	FText Title = FText::FromString(TEXT("Autonomix Privacy Disclosure"));
-	FText Message = FText::FromString(
-		TEXT("Autonomix connects to the Anthropic Claude API to provide AI assistance.\n\n")
-		TEXT("- Your prompts and project context are sent to Anthropic for processing.\n")
+	FText Message = FText::FromString(FString::Printf(
+		TEXT("Autonomix connects to external AI APIs to provide AI assistance.\n")
+		TEXT("Currently configured provider: %s\n\n")
+		TEXT("- Your prompts and project context are sent to the selected AI provider for processing.\n")
 		TEXT("- No data is stored by the Autonomix plugin itself.\n")
-		TEXT("- Anthropic's data handling is governed by their privacy policy:\n")
-		TEXT("  https://www.anthropic.com/privacy\n\n")
+		TEXT("- Data handling is governed by your AI provider's privacy policy.\n\n")
 		TEXT("By clicking OK, you acknowledge this data handling and agree to proceed.\n")
-		TEXT("You can review this at any time in Project Settings > Plugins > Autonomix.")
-	);
+		TEXT("You can review this at any time in Project Settings > Plugins > Autonomix."),
+		*ProviderName
+	));
 
 	EAppReturnType::Type Result = FMessageDialog::Open(EAppMsgType::OkCancel, Message, Title);
 
@@ -1326,7 +1329,7 @@ bool SAutonomixMainPanel::CheckPrivacyDisclosure()
 }
 
 // ============================================================================
-// User Input -> Claude API
+// User Input -> LLM API (supports all providers: Anthropic, OpenAI, Gemini, etc.)
 // ============================================================================
 
 void SAutonomixMainPanel::OnPromptSubmitted(const FString& PromptText)

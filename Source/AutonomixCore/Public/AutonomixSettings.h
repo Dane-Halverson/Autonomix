@@ -97,10 +97,11 @@ public:
 		meta = (DisplayName = "OpenAI API Key", PasswordField = true))
 	FString OpenAiApiKey;
 
-	/** OpenAI model ID. Examples: gpt-4o, gpt-4.1, o3, o4-mini, o3-mini, gpt-5.2 */
+	/** OpenAI model ID — select from the dropdown or type a custom model ID */
 	UPROPERTY(Config, EditAnywhere, BlueprintReadOnly, Category = "API|OpenAI",
-		meta = (DisplayName = "OpenAI Model ID",
-		ToolTip = "e.g. gpt-4o, gpt-4.1, o3, o4-mini, o3-mini, gpt-5.2"))
+		meta = (DisplayName = "OpenAI Model",
+		GetOptions = "GetOpenAIModelOptions",
+		ToolTip = "Select a model from the dropdown or type a custom model ID."))
 	FString OpenAiModelId;
 
 	/** OpenAI base URL. Leave empty for official OpenAI API (https://api.openai.com/v1).
@@ -109,11 +110,11 @@ public:
 		meta = (DisplayName = "OpenAI Base URL (empty = official)"))
 	FString OpenAiBaseUrl;
 
-	/** Reasoning effort for OpenAI o-series models (o3, o4-mini, o1, etc.).
-	 *  Ignored for non-reasoning models (gpt-4o, gpt-4.1). */
+	/** Reasoning effort for OpenAI reasoning models (o3, o4-mini, o1, GPT-5.x).
+	 *  Auto-ignored for non-reasoning models (gpt-4o, gpt-4.1, gpt-4.1-mini/nano). */
 	UPROPERTY(Config, EditAnywhere, BlueprintReadOnly, Category = "API|OpenAI",
-		meta = (DisplayName = "o-series Reasoning Effort",
-		ToolTip = "For o3/o4-mini/o1 reasoning models. Ignored for gpt-4o/gpt-4.1."))
+		meta = (DisplayName = "Reasoning Effort",
+		ToolTip = "For reasoning models (o3, o4-mini, o1, GPT-5.x). Auto-ignored for non-reasoning models (gpt-4o, gpt-4.1)."))
 	EAutonomixReasoningEffort OpenAiReasoningEffort;
 
 	// ============================================================================
@@ -126,10 +127,11 @@ public:
 		ToolTip = "Get your key from https://aistudio.google.com/app/apikey"))
 	FString GeminiApiKey;
 
-	/** Gemini model ID. Examples: gemini-2.5-pro, gemini-2.5-flash, gemini-3.1-pro-preview */
+	/** Gemini model — select from the dropdown or type a custom model ID */
 	UPROPERTY(Config, EditAnywhere, BlueprintReadOnly, Category = "API|Google Gemini",
-		meta = (DisplayName = "Gemini Model ID",
-		ToolTip = "e.g. gemini-2.5-pro, gemini-2.5-flash, gemini-3.1-pro-preview"))
+		meta = (DisplayName = "Gemini Model",
+		GetOptions = "GetGeminiModelOptions",
+		ToolTip = "Select a model from the dropdown or type a custom model ID."))
 	FString GeminiModelId;
 
 	/** Gemini base URL. Leave empty for official API (generativelanguage.googleapis.com).
@@ -159,10 +161,11 @@ public:
 		meta = (DisplayName = "DeepSeek API Key", PasswordField = true))
 	FString DeepSeekApiKey;
 
-	/** DeepSeek model ID. Examples: deepseek-chat, deepseek-reasoner */
+	/** DeepSeek model — select from the dropdown or type a custom model ID */
 	UPROPERTY(Config, EditAnywhere, BlueprintReadOnly, Category = "API|DeepSeek",
-		meta = (DisplayName = "DeepSeek Model ID",
-		ToolTip = "deepseek-chat (general) or deepseek-reasoner (R1, extended thinking)"))
+		meta = (DisplayName = "DeepSeek Model",
+		GetOptions = "GetDeepSeekModelOptions",
+		ToolTip = "Select a model from the dropdown or type a custom model ID."))
 	FString DeepSeekModelId;
 
 	/** DeepSeek base URL. Default: https://api.deepseek.com/v1 */
@@ -179,10 +182,11 @@ public:
 		meta = (DisplayName = "Mistral API Key", PasswordField = true))
 	FString MistralApiKey;
 
-	/** Mistral model ID. Examples: mistral-large-latest, codestral-latest, mistral-medium-latest */
+	/** Mistral model — select from the dropdown or type a custom model ID */
 	UPROPERTY(Config, EditAnywhere, BlueprintReadOnly, Category = "API|Mistral",
-		meta = (DisplayName = "Mistral Model ID",
-		ToolTip = "e.g. mistral-large-latest, codestral-latest"))
+		meta = (DisplayName = "Mistral Model",
+		GetOptions = "GetMistralModelOptions",
+		ToolTip = "Select a model from the dropdown or type a custom model ID."))
 	FString MistralModelId;
 
 	// ============================================================================
@@ -194,10 +198,11 @@ public:
 		meta = (DisplayName = "xAI API Key", PasswordField = true))
 	FString xAIApiKey;
 
-	/** xAI model ID. Examples: grok-2, grok-3, grok-3-mini */
+	/** xAI model — select from the dropdown or type a custom model ID */
 	UPROPERTY(Config, EditAnywhere, BlueprintReadOnly, Category = "API|xAI",
-		meta = (DisplayName = "xAI Model ID",
-		ToolTip = "e.g. grok-2, grok-3, grok-3-mini"))
+		meta = (DisplayName = "xAI Model",
+		GetOptions = "GetxAIModelOptions",
+		ToolTip = "Select a model from the dropdown or type a custom model ID."))
 	FString xAIModelId;
 
 	// ============================================================================
@@ -550,6 +555,30 @@ public:
 		meta = (DisplayName = "Enable Gameplay Ability System (GAS) Tools",
 		ToolTip = "Tools for creating AttributeSets, GameplayEffects, GameplayAbilities, tags, and ASC setup."))
 	bool bEnableGASTools;
+
+	// ============================================================================
+	// Model Dropdown Options (used by UPROPERTY GetOptions meta)
+	// ============================================================================
+
+	/** Returns known OpenAI model IDs for the settings dropdown */
+	UFUNCTION()
+	TArray<FString> GetOpenAIModelOptions() const;
+
+	/** Returns known Gemini model IDs for the settings dropdown */
+	UFUNCTION()
+	TArray<FString> GetGeminiModelOptions() const;
+
+	/** Returns known DeepSeek model IDs for the settings dropdown */
+	UFUNCTION()
+	TArray<FString> GetDeepSeekModelOptions() const;
+
+	/** Returns known Mistral model IDs for the settings dropdown */
+	UFUNCTION()
+	TArray<FString> GetMistralModelOptions() const;
+
+	/** Returns known xAI model IDs for the settings dropdown */
+	UFUNCTION()
+	TArray<FString> GetxAIModelOptions() const;
 
 	// ============================================================================
 	// Utility

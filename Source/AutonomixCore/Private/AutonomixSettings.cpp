@@ -20,38 +20,38 @@ UAutonomixDeveloperSettings::UAutonomixDeveloperSettings()
 	bEnableExtendedThinking = false;
 	ThinkingBudgetTokens = 3000;
 
-	// --- OpenAI defaults ---
-	OpenAiModelId = TEXT("gpt-4o");
+	// --- OpenAI defaults (from Roo Code openAiNativeDefaultModelId) ---
+	OpenAiModelId = TEXT("gpt-5.1-codex-max");
 	OpenAiBaseUrl = TEXT("");  // empty = official https://api.openai.com/v1
 	OpenAiReasoningEffort = EAutonomixReasoningEffort::Medium;
 
-	// --- Google Gemini defaults ---
-	GeminiModelId = TEXT("gemini-2.5-pro");
+	// --- Google Gemini defaults (from Roo Code geminiDefaultModelId) ---
+	GeminiModelId = TEXT("gemini-3.1-pro-preview");
 	GeminiBaseUrl = TEXT("");  // empty = official generativelanguage.googleapis.com
 	GeminiThinkingBudgetTokens = 0;  // 0 = disabled by default. User must opt-in for thinking models.
 	GeminiReasoningEffort = EAutonomixReasoningEffort::Disabled;  // Disabled by default. Prevents sending unknown fields to non-thinking models.
 
-	// --- DeepSeek defaults ---
+	// --- DeepSeek defaults (from Roo Code deepSeekDefaultModelId) ---
 	DeepSeekModelId = TEXT("deepseek-chat");
 	DeepSeekBaseUrl = TEXT("https://api.deepseek.com/v1");
 
-	// --- Mistral defaults ---
-	MistralModelId = TEXT("mistral-large-latest");
+	// --- Mistral defaults (from Roo Code mistralDefaultModelId) ---
+	MistralModelId = TEXT("codestral-latest");
 
-	// --- xAI defaults ---
-	xAIModelId = TEXT("grok-3");
+	// --- xAI defaults (from Roo Code xaiDefaultModelId) ---
+	xAIModelId = TEXT("grok-code-fast-1");
 
-	// --- OpenRouter defaults ---
-	OpenRouterModelId = TEXT("anthropic/claude-sonnet-4-6");
+	// --- OpenRouter defaults (from Roo Code openRouterDefaultModelId) ---
+	OpenRouterModelId = TEXT("anthropic/claude-sonnet-4.5");
 
-	// --- Ollama defaults ---
+	// --- Ollama defaults (from Roo Code ollamaDefaultModelId) ---
 	OllamaBaseUrl = TEXT("http://localhost:11434");
-	OllamaModelId = TEXT("llama3.1");
+	OllamaModelId = TEXT("devstral:24b");
 	OllamaContextSize = 8192;
 
-	// --- LM Studio defaults ---
+	// --- LM Studio defaults (from Roo Code lMStudioDefaultModelId) ---
 	LMStudioBaseUrl = TEXT("http://localhost:1234");
-	LMStudioModelId = TEXT("");
+	LMStudioModelId = TEXT("mistralai/devstral-small-2505");
 
 	// --- Custom endpoint defaults ---
 	CustomBaseUrl = TEXT("");
@@ -145,9 +145,12 @@ FString UAutonomixDeveloperSettings::GetEffectiveEndpoint() const
 	case EAutonomixProvider::OpenRouter:
 		return TEXT("https://openrouter.ai/api/v1");
 	case EAutonomixProvider::Ollama:
-		return OllamaBaseUrl.IsEmpty() ? TEXT("http://localhost:11434") : OllamaBaseUrl;
+		// CRITICAL FIX: Ollama's OpenAI-compatible endpoint is at /v1/chat/completions.
+		// The OpenAICompatClient appends /chat/completions, so the base must include /v1.
+		return OllamaBaseUrl.IsEmpty() ? TEXT("http://localhost:11434/v1") : OllamaBaseUrl;
 	case EAutonomixProvider::LMStudio:
-		return LMStudioBaseUrl.IsEmpty() ? TEXT("http://localhost:1234") : LMStudioBaseUrl;
+		// CRITICAL FIX: LM Studio's OpenAI-compatible endpoint is at /v1/chat/completions.
+		return LMStudioBaseUrl.IsEmpty() ? TEXT("http://localhost:1234/v1") : LMStudioBaseUrl;
 	case EAutonomixProvider::Custom:
 		return CustomBaseUrl;
 	default:
@@ -184,21 +187,21 @@ FString UAutonomixDeveloperSettings::GetEffectiveModel() const
 		return ModelEnumToApiString(ClaudeModel);
 	}
 	case EAutonomixProvider::OpenAI:
-		return OpenAiModelId.IsEmpty() ? TEXT("gpt-4o") : OpenAiModelId;
+		return OpenAiModelId.IsEmpty() ? TEXT("gpt-5.1-codex-max") : OpenAiModelId;
 	case EAutonomixProvider::Google:
-		return GeminiModelId.IsEmpty() ? TEXT("gemini-2.5-pro") : GeminiModelId;
+		return GeminiModelId.IsEmpty() ? TEXT("gemini-3.1-pro-preview") : GeminiModelId;
 	case EAutonomixProvider::DeepSeek:
 		return DeepSeekModelId.IsEmpty() ? TEXT("deepseek-chat") : DeepSeekModelId;
 	case EAutonomixProvider::Mistral:
-		return MistralModelId.IsEmpty() ? TEXT("mistral-large-latest") : MistralModelId;
+		return MistralModelId.IsEmpty() ? TEXT("codestral-latest") : MistralModelId;
 	case EAutonomixProvider::xAI:
-		return xAIModelId.IsEmpty() ? TEXT("grok-3") : xAIModelId;
+		return xAIModelId.IsEmpty() ? TEXT("grok-code-fast-1") : xAIModelId;
 	case EAutonomixProvider::OpenRouter:
-		return OpenRouterModelId.IsEmpty() ? TEXT("anthropic/claude-sonnet-4-6") : OpenRouterModelId;
+		return OpenRouterModelId.IsEmpty() ? TEXT("anthropic/claude-sonnet-4.5") : OpenRouterModelId;
 	case EAutonomixProvider::Ollama:
-		return OllamaModelId.IsEmpty() ? TEXT("llama3.1") : OllamaModelId;
+		return OllamaModelId.IsEmpty() ? TEXT("devstral:24b") : OllamaModelId;
 	case EAutonomixProvider::LMStudio:
-		return LMStudioModelId.IsEmpty() ? TEXT("local-model") : LMStudioModelId;
+		return LMStudioModelId.IsEmpty() ? TEXT("mistralai/devstral-small-2505") : LMStudioModelId;
 	case EAutonomixProvider::Custom:
 		return CustomEndpointModelId;
 	default:
@@ -415,3 +418,123 @@ void UAutonomixDeveloperSettings::PostEditChangeProperty(FPropertyChangedEvent& 
 	}
 }
 #endif
+
+// ============================================================================
+// Model dropdown options (UFUNCTION used by UPROPERTY GetOptions meta)
+// Model lists sourced from Roo Code packages/types/src/providers/*.ts
+// ============================================================================
+
+// Complete model lists sourced from Roo Code packages/types/src/providers/*.ts
+// Every model ID matches exactly what Roo Code defines in its type files.
+
+TArray<FString> UAutonomixDeveloperSettings::GetOpenAIModelOptions() const
+{
+	// Source: Roo-Code-main/packages/types/src/providers/openai.ts (openAiNativeModels)
+	return {
+		// GPT-5.x flagship series
+		TEXT("gpt-5.4"),
+		TEXT("gpt-5.3-codex"),
+		TEXT("gpt-5.3-chat-latest"),
+		TEXT("gpt-5.2"),
+		TEXT("gpt-5.2-codex"),
+		TEXT("gpt-5.2-chat-latest"),
+		TEXT("gpt-5.1-codex-max"),
+		TEXT("gpt-5.1"),
+		TEXT("gpt-5.1-codex"),
+		TEXT("gpt-5.1-codex-mini"),
+		TEXT("gpt-5"),
+		TEXT("gpt-5-mini"),
+		TEXT("gpt-5-codex"),
+		TEXT("gpt-5-nano"),
+		TEXT("gpt-5-chat-latest"),
+		// GPT-4.x series
+		TEXT("gpt-4.1"),
+		TEXT("gpt-4.1-mini"),
+		TEXT("gpt-4.1-nano"),
+		TEXT("gpt-4o"),
+		TEXT("gpt-4o-mini"),
+		// o-series (reasoning models)
+		TEXT("o3"),
+		TEXT("o3-high"),
+		TEXT("o3-low"),
+		TEXT("o4-mini"),
+		TEXT("o4-mini-high"),
+		TEXT("o4-mini-low"),
+		TEXT("o3-mini"),
+		TEXT("o3-mini-high"),
+		TEXT("o3-mini-low"),
+		TEXT("o1"),
+		TEXT("o1-preview"),
+		TEXT("o1-mini"),
+		// Codex agent
+		TEXT("codex-mini-latest"),
+		// Dated snapshots (backward compatibility)
+		TEXT("gpt-5-2025-08-07"),
+		TEXT("gpt-5-mini-2025-08-07"),
+		TEXT("gpt-5-nano-2025-08-07"),
+	};
+}
+
+TArray<FString> UAutonomixDeveloperSettings::GetGeminiModelOptions() const
+{
+	// Source: Roo-Code-main/packages/types/src/providers/gemini.ts (geminiModels)
+	return {
+		// Gemini 3.x (reasoning effort models)
+		TEXT("gemini-3.1-pro-preview"),
+		TEXT("gemini-3.1-pro-preview-customtools"),
+		TEXT("gemini-3-pro-preview"),
+		TEXT("gemini-3-flash-preview"),
+		// Gemini 2.5 Pro (thinking budget models)
+		TEXT("gemini-2.5-pro"),
+		TEXT("gemini-2.5-pro-preview-06-05"),
+		TEXT("gemini-2.5-pro-preview-05-06"),
+		TEXT("gemini-2.5-pro-preview-03-25"),
+		// Gemini 2.5 Flash
+		TEXT("gemini-flash-latest"),
+		TEXT("gemini-2.5-flash-preview-09-2025"),
+		TEXT("gemini-2.5-flash"),
+		// Gemini 2.5 Flash Lite
+		TEXT("gemini-flash-lite-latest"),
+		TEXT("gemini-2.5-flash-lite-preview-09-2025"),
+	};
+}
+
+TArray<FString> UAutonomixDeveloperSettings::GetDeepSeekModelOptions() const
+{
+	// Source: Roo-Code-main/packages/types/src/providers/deepseek.ts (deepSeekModels)
+	return {
+		TEXT("deepseek-chat"),
+		TEXT("deepseek-reasoner"),
+	};
+}
+
+TArray<FString> UAutonomixDeveloperSettings::GetMistralModelOptions() const
+{
+	// Source: Roo-Code-main/packages/types/src/providers/mistral.ts (mistralModels)
+	return {
+		TEXT("magistral-medium-latest"),
+		TEXT("devstral-medium-latest"),
+		TEXT("mistral-medium-latest"),
+		TEXT("codestral-latest"),
+		TEXT("mistral-large-latest"),
+		TEXT("ministral-8b-latest"),
+		TEXT("ministral-3b-latest"),
+		TEXT("mistral-small-latest"),
+		TEXT("pixtral-large-latest"),
+	};
+}
+
+TArray<FString> UAutonomixDeveloperSettings::GetxAIModelOptions() const
+{
+	// Source: Roo-Code-main/packages/types/src/providers/xai.ts (xaiModels)
+	return {
+		TEXT("grok-code-fast-1"),
+		TEXT("grok-4-1-fast-reasoning"),
+		TEXT("grok-4-1-fast-non-reasoning"),
+		TEXT("grok-4-fast-reasoning"),
+		TEXT("grok-4-fast-non-reasoning"),
+		TEXT("grok-4-0709"),
+		TEXT("grok-3-mini"),
+		TEXT("grok-3"),
+	};
+}

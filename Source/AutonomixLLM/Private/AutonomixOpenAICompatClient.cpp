@@ -7,7 +7,49 @@
 #include "Interfaces/IHttpResponse.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "Misc/SecureHash.h"
 #include "Async/Async.h"
+
+// ==========================================================================
+// Call ID sanitization for OpenAI Responses API
+// Ported from Roo Code utils/tool-id.ts sanitizeOpenAiCallId()
+// ==========================================================================
+
+/** Sanitize a tool call ID to match OpenAI's validation pattern: ^[a-zA-Z0-9_-]+$
+ *  and truncate to 64 characters max. Uses MD5 hash suffix for uniqueness when truncating. */
+static FString SanitizeCallId(const FString& Id)
+{
+	static constexpr int32 MaxLength = 64;
+
+	// Step 1: Replace any invalid characters with underscore
+	FString Sanitized;
+	Sanitized.Reserve(Id.Len());
+	for (TCHAR Ch : Id)
+	{
+		if ((Ch >= TEXT('a') && Ch <= TEXT('z')) ||
+			(Ch >= TEXT('A') && Ch <= TEXT('Z')) ||
+			(Ch >= TEXT('0') && Ch <= TEXT('9')) ||
+			Ch == TEXT('_') || Ch == TEXT('-'))
+		{
+			Sanitized.AppendChar(Ch);
+		}
+		else
+		{
+			Sanitized.AppendChar(TEXT('_'));
+		}
+	}
+
+	// Step 2: Truncate with hash suffix if needed
+	if (Sanitized.Len() <= MaxLength)
+	{
+		return Sanitized;
+	}
+
+	// Use 8-char MD5 hash suffix for uniqueness
+	FString Hash = FMD5::HashAnsiString(*Id).Left(8);
+	int32 PrefixLen = MaxLength - 1 - 8; // 1 for separator underscore
+	return Sanitized.Left(PrefixLen) + TEXT("_") + Hash;
+}
 
 FAutonomixOpenAICompatClient::FAutonomixOpenAICompatClient()
 	: BaseUrl(TEXT("https://api.openai.com/v1"))
@@ -71,15 +113,27 @@ void FAutonomixOpenAICompatClient::SendMessage(
 	RetrySystemPrompt = SystemPrompt;
 	RetryToolSchemas = ToolSchemas;
 
+	// Detect whether to use Responses API or Chat Completions
+	// GPT-5.x and newer OpenAI models REQUIRE the Responses API (/v1/responses).
+	// Other providers (DeepSeek, Mistral, xAI, Ollama, etc.) use Chat Completions.
+	bUseResponsesAPI = (Provider == EAutonomixProvider::OpenAI);
+
 	TSharedPtr<FJsonObject> Body = BuildRequestBody(ConversationHistory, SystemPrompt, ToolSchemas);
 	FString BodyString;
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BodyString);
 	FJsonSerializer::Serialize(Body.ToSharedRef(), Writer);
 
-	// Build URL: BaseUrl already has /v1, append /chat/completions
+	// Build URL based on API type
 	FString Url = BaseUrl;
 	if (!Url.EndsWith(TEXT("/"))) Url += TEXT("/");
-	Url += TEXT("chat/completions");
+	if (bUseResponsesAPI)
+	{
+		Url += TEXT("responses");
+	}
+	else
+	{
+		Url += TEXT("chat/completions");
+	}
 
 	CurrentRequest = FHttpModule::Get().CreateRequest();
 	CurrentRequest->SetURL(Url);
@@ -147,10 +201,651 @@ TSharedPtr<FJsonObject> FAutonomixOpenAICompatClient::BuildRequestBody(
 	const FString& SystemPrompt,
 	const TArray<TSharedPtr<FJsonObject>>& ToolSchemas) const
 {
+	if (bUseResponsesAPI)
+	{
+		return BuildResponsesAPIBody(History, SystemPrompt, ToolSchemas);
+	}
+	return BuildChatCompletionsBody(History, SystemPrompt, ToolSchemas);
+}
+
+// ==========================================================================
+// Schema sanitization for OpenAI Responses API
+// Ported from Roo Code openai-native.ts ensureAllRequired() + ensureAdditionalPropertiesFalse()
+// ==========================================================================
+
+/** Recursively checks if a schema contains any free-form objects (type:"object" without "properties").
+ *  Such schemas are incompatible with strict:true because OpenAI requires required=[all keys]. */
+static bool HasFreeFormObjects(const TSharedPtr<FJsonObject>& Schema)
+{
+	if (!Schema.IsValid()) return false;
+
+	FString Type;
+	Schema->TryGetStringField(TEXT("type"), Type);
+
+	if (Type == TEXT("object"))
+	{
+		const TSharedPtr<FJsonObject>* PropsObj = nullptr;
+		if (!Schema->TryGetObjectField(TEXT("properties"), PropsObj))
+		{
+			// type:"object" with no "properties" field = free-form dictionary
+			return true;
+		}
+
+		// Check nested properties recursively
+		TArray<FString> AllKeys;
+		(*PropsObj)->Values.GetKeys(AllKeys);
+		for (const FString& Key : AllKeys)
+		{
+			const TSharedPtr<FJsonObject>* PropObj = nullptr;
+			if ((*PropsObj)->TryGetObjectField(Key, PropObj))
+			{
+				if (HasFreeFormObjects(*PropObj))
+				{
+					return true;
+				}
+			}
+		}
+	}
+	else if (Type == TEXT("array"))
+	{
+		const TSharedPtr<FJsonObject>* ItemsObj = nullptr;
+		if (Schema->TryGetObjectField(TEXT("items"), ItemsObj))
+		{
+			if (HasFreeFormObjects(*ItemsObj))
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+/** Recursively adds additionalProperties:false and required:[all keys] to JSON schemas.
+ *  Used for strict:true tools. OpenAI Responses API rejects schemas missing these fields.
+ *  Ported from Roo Code openai-native.ts ensureAllRequired(). */
+static void EnsureStrictSchema(TSharedPtr<FJsonObject> Schema)
+{
+	if (!Schema.IsValid()) return;
+
+	FString Type;
+	Schema->TryGetStringField(TEXT("type"), Type);
+	if (Type != TEXT("object")) return;
+
+	// Add additionalProperties: false
+	Schema->SetBoolField(TEXT("additionalProperties"), false);
+
+	// Make all properties required
+	const TSharedPtr<FJsonObject>* PropsObj = nullptr;
+	if (Schema->TryGetObjectField(TEXT("properties"), PropsObj))
+	{
+		TArray<FString> AllKeys;
+		(*PropsObj)->Values.GetKeys(AllKeys);
+
+		// Set required = all keys
+		TArray<TSharedPtr<FJsonValue>> RequiredArr;
+		for (const FString& Key : AllKeys)
+		{
+			RequiredArr.Add(MakeShared<FJsonValueString>(Key));
+		}
+		Schema->SetArrayField(TEXT("required"), RequiredArr);
+
+		// Recurse into nested objects and array items
+		for (const FString& Key : AllKeys)
+		{
+			const TSharedPtr<FJsonObject>* PropObj = nullptr;
+			if ((*PropsObj)->TryGetObjectField(Key, PropObj))
+			{
+				FString PropType;
+				(*PropObj)->TryGetStringField(TEXT("type"), PropType);
+				if (PropType == TEXT("object"))
+				{
+					EnsureStrictSchema(const_cast<TSharedPtr<FJsonObject>&>(*PropObj));
+				}
+				else if (PropType == TEXT("array"))
+				{
+					const TSharedPtr<FJsonObject>* ItemsObj = nullptr;
+					if ((*PropObj)->TryGetObjectField(TEXT("items"), ItemsObj))
+					{
+						FString ItemType;
+						(*ItemsObj)->TryGetStringField(TEXT("type"), ItemType);
+						if (ItemType == TEXT("object"))
+						{
+							EnsureStrictSchema(const_cast<TSharedPtr<FJsonObject>&>(*ItemsObj));
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+/** Recursively adds additionalProperties:false to all object schemas without modifying required.
+ *  Used for strict:false tools that have free-form objects (type:"object" without "properties").
+ *  Ported from Roo Code openai-native.ts ensureAdditionalPropertiesFalse(). */
+static void EnsureAdditionalPropertiesFalse(TSharedPtr<FJsonObject> Schema)
+{
+	if (!Schema.IsValid()) return;
+
+	FString Type;
+	Schema->TryGetStringField(TEXT("type"), Type);
+	if (Type != TEXT("object")) return;
+
+	// Add additionalProperties: false
+	Schema->SetBoolField(TEXT("additionalProperties"), false);
+
+	// Recurse into nested objects and array items (but do NOT modify required)
+	const TSharedPtr<FJsonObject>* PropsObj = nullptr;
+	if (Schema->TryGetObjectField(TEXT("properties"), PropsObj))
+	{
+		TArray<FString> AllKeys;
+		(*PropsObj)->Values.GetKeys(AllKeys);
+
+		for (const FString& Key : AllKeys)
+		{
+			const TSharedPtr<FJsonObject>* PropObj = nullptr;
+			if ((*PropsObj)->TryGetObjectField(Key, PropObj))
+			{
+				FString PropType;
+				(*PropObj)->TryGetStringField(TEXT("type"), PropType);
+				if (PropType == TEXT("object"))
+				{
+					EnsureAdditionalPropertiesFalse(const_cast<TSharedPtr<FJsonObject>&>(*PropObj));
+				}
+				else if (PropType == TEXT("array"))
+				{
+					const TSharedPtr<FJsonObject>* ItemsObj = nullptr;
+					if ((*PropObj)->TryGetObjectField(TEXT("items"), ItemsObj))
+					{
+						FString ItemType;
+						(*ItemsObj)->TryGetStringField(TEXT("type"), ItemType);
+						if (ItemType == TEXT("object"))
+						{
+							EnsureAdditionalPropertiesFalse(const_cast<TSharedPtr<FJsonObject>&>(*ItemsObj));
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// ==========================================================================
+// Responses API (OpenAI native — GPT-5.x, GPT-4.1, o-series with tools)
+// Ported from Roo Code openai-native.ts buildRequestBody + formatFullConversation
+// ==========================================================================
+
+TSharedPtr<FJsonObject> FAutonomixOpenAICompatClient::BuildResponsesAPIBody(
+	const TArray<FAutonomixMessage>& History,
+	const FString& SystemPrompt,
+	const TArray<TSharedPtr<FJsonObject>>& ToolSchemas) const
+{
+	TSharedPtr<FJsonObject> Body = MakeShared<FJsonObject>();
+	Body->SetStringField(TEXT("model"), ModelId);
+	Body->SetBoolField(TEXT("stream"), bStreamingEnabled);
+	Body->SetBoolField(TEXT("store"), false);  // Stateless operation
+
+	// System prompt goes in top-level 'instructions' field (not as a message)
+	if (!SystemPrompt.IsEmpty())
+	{
+		Body->SetStringField(TEXT("instructions"), SystemPrompt);
+	}
+
+	// max_output_tokens (Responses API uses this, not max_tokens or max_completion_tokens)
+	Body->SetNumberField(TEXT("max_output_tokens"), (double)MaxTokens);
+
+	// Detect if model supports reasoning effort (ported from Roo Code model info):
+	// - o-series (o1, o3, o4) → YES
+	// - GPT-5.x → YES
+	// - gpt-4o, gpt-4.1 (including mini/nano) → NO
+	// - codex models → NO (they are code-specific, not reasoning)
+	bool bModelSupportsReasoning =
+		ModelId.StartsWith(TEXT("o1")) ||
+		ModelId.StartsWith(TEXT("o3")) ||
+		ModelId.StartsWith(TEXT("o4")) ||
+		ModelId.StartsWith(TEXT("gpt-5"));
+
+	// Effective reasoning effort: auto-disable for non-reasoning models
+	EAutonomixReasoningEffort EffectiveReasoning =
+		bModelSupportsReasoning ? ReasoningEffort : EAutonomixReasoningEffort::Disabled;
+
+	// Temperature: reasoning models don't support temperature
+	bool bModelSupportsTemp = !bModelSupportsReasoning &&
+		(EffectiveReasoning == EAutonomixReasoningEffort::Disabled);
+	if (bModelSupportsTemp)
+	{
+		Body->SetNumberField(TEXT("temperature"), 0.0);
+	}
+
+	// Reasoning effort (only for models that support it)
+	if (EffectiveReasoning != EAutonomixReasoningEffort::Disabled)
+	{
+		TSharedPtr<FJsonObject> ReasoningObj = MakeShared<FJsonObject>();
+		FString EffortStr = ReasoningEffortToString(EffectiveReasoning);
+		if (!EffortStr.IsEmpty())
+		{
+			ReasoningObj->SetStringField(TEXT("effort"), EffortStr);
+		}
+		Body->SetObjectField(TEXT("reasoning"), ReasoningObj);
+	}
+
+	// Input array (Responses API format: messages + function_call + function_call_output items)
+	Body->SetArrayField(TEXT("input"), ConvertToResponsesInput(History));
+
+	// Tools (Responses API format: same as Chat Completions but with optional 'strict' field)
+	if (ToolSchemas.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> ToolsArray;
+		for (const TSharedPtr<FJsonObject>& Schema : ToolSchemas)
+		{
+			if (!Schema.IsValid()) continue;
+
+			TSharedPtr<FJsonObject> Tool = MakeShared<FJsonObject>();
+			Tool->SetStringField(TEXT("type"), TEXT("function"));
+
+			FString Name, Desc;
+			Schema->TryGetStringField(TEXT("name"), Name);
+			Schema->TryGetStringField(TEXT("description"), Desc);
+			Tool->SetStringField(TEXT("name"), Name);
+			if (!Desc.IsEmpty()) Tool->SetStringField(TEXT("description"), Desc);
+
+			const TSharedPtr<FJsonObject>* InputSchema = nullptr;
+			if (Schema->TryGetObjectField(TEXT("input_schema"), InputSchema))
+			{
+				// Deep clone the schema so we don't mutate the original
+				FString SchemaStr;
+				TSharedRef<TJsonWriter<>> SchemaWriter = TJsonWriterFactory<>::Create(&SchemaStr);
+				FJsonSerializer::Serialize(InputSchema->ToSharedRef(), SchemaWriter);
+				TSharedPtr<FJsonObject> ClonedSchema;
+				TSharedRef<TJsonReader<>> SchemaReader = TJsonReaderFactory<>::Create(SchemaStr);
+				FJsonSerializer::Deserialize(SchemaReader, ClonedSchema);
+
+				// Two-path approach ported from Roo Code openai-native.ts:
+				// - Tools with well-defined schemas: strict:true + ensureAllRequired
+				// - Tools with free-form objects (type:"object" without "properties"):
+				//   strict:false + ensureAdditionalPropertiesFalse
+				const bool bHasFreeForm = HasFreeFormObjects(ClonedSchema);
+				if (bHasFreeForm)
+				{
+					EnsureAdditionalPropertiesFalse(ClonedSchema);
+				}
+				else
+				{
+					EnsureStrictSchema(ClonedSchema);
+				}
+				Tool->SetObjectField(TEXT("parameters"), ClonedSchema);
+				Tool->SetBoolField(TEXT("strict"), !bHasFreeForm);
+			}
+			else
+			{
+				// No input_schema — use strict:false
+				Tool->SetBoolField(TEXT("strict"), false);
+			}
+
+			ToolsArray.Add(MakeShared<FJsonValueObject>(Tool));
+		}
+		Body->SetArrayField(TEXT("tools"), ToolsArray);
+	}
+
+	return Body;
+}
+
+TArray<TSharedPtr<FJsonValue>> FAutonomixOpenAICompatClient::ConvertToResponsesInput(
+	const TArray<FAutonomixMessage>& Messages) const
+{
+	// Ported from Roo Code openai-native.ts formatFullConversation
+	// Responses API uses: {role: "user", content: [{type: "input_text", text}]}
+	//                     {role: "assistant", content: [{type: "output_text", text}]}
+	//                     {type: "function_call", call_id, name, arguments}
+	//                     {type: "function_call_output", call_id, output}
+	TArray<TSharedPtr<FJsonValue>> Result;
+
+	for (const FAutonomixMessage& Msg : Messages)
+	{
+		switch (Msg.Role)
+		{
+		case EAutonomixMessageRole::User:
+		{
+			TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+			Item->SetStringField(TEXT("role"), TEXT("user"));
+			TArray<TSharedPtr<FJsonValue>> ContentArr;
+			TSharedPtr<FJsonObject> TextPart = MakeShared<FJsonObject>();
+			TextPart->SetStringField(TEXT("type"), TEXT("input_text"));
+			TextPart->SetStringField(TEXT("text"), Msg.Content);
+			ContentArr.Add(MakeShared<FJsonValueObject>(TextPart));
+			Item->SetArrayField(TEXT("content"), ContentArr);
+			Result.Add(MakeShared<FJsonValueObject>(Item));
+			break;
+		}
+		case EAutonomixMessageRole::Assistant:
+		{
+			// Check for tool_use blocks in ContentBlocksJson
+			if (!Msg.ContentBlocksJson.IsEmpty())
+			{
+				TArray<TSharedPtr<FJsonValue>> Blocks;
+				TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Msg.ContentBlocksJson);
+				if (FJsonSerializer::Deserialize(Reader, Blocks))
+				{
+					// Add text content as assistant message
+					TArray<TSharedPtr<FJsonValue>> ContentArr;
+					TArray<TSharedPtr<FJsonValue>> ToolCalls;
+
+					for (const TSharedPtr<FJsonValue>& BlockVal : Blocks)
+					{
+						TSharedPtr<FJsonObject> Block = BlockVal->AsObject();
+						if (!Block.IsValid()) continue;
+						FString Type;
+						Block->TryGetStringField(TEXT("type"), Type);
+
+						if (Type == TEXT("text"))
+						{
+							FString Text;
+							Block->TryGetStringField(TEXT("text"), Text);
+							TSharedPtr<FJsonObject> TextPart = MakeShared<FJsonObject>();
+							TextPart->SetStringField(TEXT("type"), TEXT("output_text"));
+							TextPart->SetStringField(TEXT("text"), Text);
+							ContentArr.Add(MakeShared<FJsonValueObject>(TextPart));
+						}
+						else if (Type == TEXT("tool_use"))
+						{
+							// Convert to Responses API function_call item
+							FString TUId, TUName;
+							Block->TryGetStringField(TEXT("id"), TUId);
+							Block->TryGetStringField(TEXT("name"), TUName);
+							const TSharedPtr<FJsonObject>* InputObj = nullptr;
+							FString InputStr;
+							if (Block->TryGetObjectField(TEXT("input"), InputObj))
+							{
+								TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&InputStr);
+								FJsonSerializer::Serialize(InputObj->ToSharedRef(), W);
+							}
+
+							TSharedPtr<FJsonObject> FuncCall = MakeShared<FJsonObject>();
+							FuncCall->SetStringField(TEXT("type"), TEXT("function_call"));
+							FuncCall->SetStringField(TEXT("call_id"), SanitizeCallId(TUId));
+							FuncCall->SetStringField(TEXT("name"), TUName);
+							FuncCall->SetStringField(TEXT("arguments"), InputStr);
+							ToolCalls.Add(MakeShared<FJsonValueObject>(FuncCall));
+						}
+					}
+
+					// Add assistant message with text content
+					if (ContentArr.Num() > 0)
+					{
+						TSharedPtr<FJsonObject> AssistantItem = MakeShared<FJsonObject>();
+						AssistantItem->SetStringField(TEXT("role"), TEXT("assistant"));
+						AssistantItem->SetArrayField(TEXT("content"), ContentArr);
+						Result.Add(MakeShared<FJsonValueObject>(AssistantItem));
+					}
+
+					// Add tool calls as separate items
+					for (const TSharedPtr<FJsonValue>& TC : ToolCalls)
+					{
+						Result.Add(TC);
+					}
+				}
+			}
+			else if (!Msg.Content.IsEmpty())
+			{
+				TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+				Item->SetStringField(TEXT("role"), TEXT("assistant"));
+				TArray<TSharedPtr<FJsonValue>> ContentArr;
+				TSharedPtr<FJsonObject> TextPart = MakeShared<FJsonObject>();
+				TextPart->SetStringField(TEXT("type"), TEXT("output_text"));
+				TextPart->SetStringField(TEXT("text"), Msg.Content);
+				ContentArr.Add(MakeShared<FJsonValueObject>(TextPart));
+				Item->SetArrayField(TEXT("content"), ContentArr);
+				Result.Add(MakeShared<FJsonValueObject>(Item));
+			}
+			break;
+		}
+		case EAutonomixMessageRole::ToolResult:
+		{
+			// Responses API: function_call_output item
+			TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+			Item->SetStringField(TEXT("type"), TEXT("function_call_output"));
+			Item->SetStringField(TEXT("call_id"), SanitizeCallId(Msg.ToolUseId));
+			Item->SetStringField(TEXT("output"), Msg.Content);
+			Result.Add(MakeShared<FJsonValueObject>(Item));
+			break;
+		}
+		default:
+			break;
+		}
+	}
+
+	// CRITICAL: OpenAI Responses API requires every function_call to have a matching
+	// function_call_output. If a conversation was interrupted mid-tool-execution
+	// (or loaded from a Claude session), orphaned function_calls cause:
+	// "No tool output found for function call toolu_XXX"
+	// Scan the result and inject synthetic outputs for orphaned function_calls.
+	TSet<FString> FunctionCallIds;
+	TSet<FString> FunctionOutputIds;
+	for (const TSharedPtr<FJsonValue>& Val : Result)
+	{
+		TSharedPtr<FJsonObject> Obj = Val->AsObject();
+		if (!Obj.IsValid()) continue;
+		FString Type;
+		Obj->TryGetStringField(TEXT("type"), Type);
+		if (Type == TEXT("function_call"))
+		{
+			FString CallId;
+			Obj->TryGetStringField(TEXT("call_id"), CallId);
+			if (!CallId.IsEmpty()) FunctionCallIds.Add(CallId);
+		}
+		else if (Type == TEXT("function_call_output"))
+		{
+			FString CallId;
+			Obj->TryGetStringField(TEXT("call_id"), CallId);
+			if (!CallId.IsEmpty()) FunctionOutputIds.Add(CallId);
+		}
+	}
+
+	// Direction 1: Inject synthetic function_call_output for orphaned function_calls
+	for (const FString& CallId : FunctionCallIds)
+	{
+		if (!FunctionOutputIds.Contains(CallId))
+		{
+			TSharedPtr<FJsonObject> SyntheticOutput = MakeShared<FJsonObject>();
+			SyntheticOutput->SetStringField(TEXT("type"), TEXT("function_call_output"));
+			SyntheticOutput->SetStringField(TEXT("call_id"), CallId);
+			SyntheticOutput->SetStringField(TEXT("output"), TEXT("(tool execution was interrupted)"));
+			Result.Add(MakeShared<FJsonValueObject>(SyntheticOutput));
+			UE_LOG(LogAutonomix, Warning,
+				TEXT("OpenAICompatClient: Injected synthetic function_call_output for orphaned call_id=%s"), *CallId);
+		}
+	}
+
+	// Direction 2: Remove orphaned function_call_outputs that have no matching function_call.
+	// This happens when resuming a Claude session — ToolResult messages reference toolu_XXX IDs
+	// but the corresponding assistant tool_use blocks may be corrupted or missing.
+	Result.RemoveAll([&FunctionCallIds](const TSharedPtr<FJsonValue>& Val) -> bool
+	{
+		TSharedPtr<FJsonObject> Obj = Val->AsObject();
+		if (!Obj.IsValid()) return false;
+		FString Type;
+		Obj->TryGetStringField(TEXT("type"), Type);
+		if (Type != TEXT("function_call_output")) return false;
+		FString CallId;
+		Obj->TryGetStringField(TEXT("call_id"), CallId);
+		if (CallId.IsEmpty()) return true; // Remove empty-ID outputs
+		if (!FunctionCallIds.Contains(CallId))
+		{
+			UE_LOG(LogAutonomix, Warning,
+				TEXT("OpenAICompatClient: Removed orphaned function_call_output with no matching call: call_id=%s"), *CallId);
+			return true; // Remove — no matching function_call exists
+		}
+		return false;
+	});
+
+	return Result;
+}
+
+void FAutonomixOpenAICompatClient::ProcessResponsesSSEEvent(const FString& DataJson)
+{
+	// Ported from Roo Code openai-native.ts processEvent + handleStreamResponse
+	// Responses API sends typed events like: response.output_text.delta, response.output_item.done, etc.
+	TSharedPtr<FJsonObject> Obj;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(DataJson);
+	if (!FJsonSerializer::Deserialize(Reader, Obj) || !Obj.IsValid()) return;
+
+	FString EventType;
+	Obj->TryGetStringField(TEXT("type"), EventType);
+
+	// Text deltas
+	if (EventType == TEXT("response.output_text.delta") || EventType == TEXT("response.text.delta"))
+	{
+		FString Delta;
+		Obj->TryGetStringField(TEXT("delta"), Delta);
+		if (!Delta.IsEmpty())
+		{
+			CurrentAssistantContent += Delta;
+			StreamingTextDelegate.Broadcast(CurrentMessageId, Delta);
+		}
+		return;
+	}
+
+	// Tool call argument deltas — accumulate
+	if (EventType == TEXT("response.function_call_arguments.delta") ||
+		EventType == TEXT("response.tool_call_arguments.delta"))
+	{
+		FString ArgsDelta;
+		Obj->TryGetStringField(TEXT("delta"), ArgsDelta);
+		if (!ArgsDelta.IsEmpty() && PendingToolCallStates.Num() > 0)
+		{
+			PendingToolCallStates.Last().ArgumentsAccumulated += ArgsDelta;
+		}
+		return;
+	}
+
+	// Output item added — captures function_call identity
+	if (EventType == TEXT("response.output_item.added"))
+	{
+		const TSharedPtr<FJsonObject>* ItemObj = nullptr;
+		if (Obj->TryGetObjectField(TEXT("item"), ItemObj))
+		{
+			FString ItemType;
+			(*ItemObj)->TryGetStringField(TEXT("type"), ItemType);
+			if (ItemType == TEXT("function_call"))
+			{
+				FPendingToolCallState State;
+				(*ItemObj)->TryGetStringField(TEXT("call_id"), State.ToolUseId);
+				(*ItemObj)->TryGetStringField(TEXT("name"), State.ToolName);
+				State.Index = PendingToolCallStates.Num();
+				PendingToolCallStates.Add(State);
+			}
+		}
+		return;
+	}
+
+	// Output item done — function_call complete (fallback for non-streaming tool calls)
+	if (EventType == TEXT("response.output_item.done"))
+	{
+		const TSharedPtr<FJsonObject>* ItemObj = nullptr;
+		if (Obj->TryGetObjectField(TEXT("item"), ItemObj))
+		{
+			FString ItemType;
+			(*ItemObj)->TryGetStringField(TEXT("type"), ItemType);
+
+			if (ItemType == TEXT("function_call"))
+			{
+				FString CallId, Name, ArgsStr;
+				(*ItemObj)->TryGetStringField(TEXT("call_id"), CallId);
+				(*ItemObj)->TryGetStringField(TEXT("name"), Name);
+				(*ItemObj)->TryGetStringField(TEXT("arguments"), ArgsStr);
+
+				// Check if we already have this from streaming deltas
+				bool bAlreadyStreamed = false;
+				for (const FPendingToolCallState& S : PendingToolCallStates)
+				{
+					if (S.ToolUseId == CallId && !S.ArgumentsAccumulated.IsEmpty())
+					{
+						bAlreadyStreamed = true;
+						break;
+					}
+				}
+
+				if (!bAlreadyStreamed && !Name.IsEmpty())
+				{
+					FPendingToolCallState State;
+					State.ToolUseId = CallId;
+					State.ToolName = Name;
+					State.ArgumentsAccumulated = ArgsStr;
+					State.Index = PendingToolCallStates.Num();
+					PendingToolCallStates.Add(State);
+				}
+			}
+			// Text output done — fallback for non-streaming text
+			else if ((ItemType == TEXT("text") || ItemType == TEXT("output_text")) && CurrentAssistantContent.IsEmpty())
+			{
+				FString Text;
+				(*ItemObj)->TryGetStringField(TEXT("text"), Text);
+				if (!Text.IsEmpty())
+				{
+					CurrentAssistantContent += Text;
+					StreamingTextDelegate.Broadcast(CurrentMessageId, Text);
+				}
+			}
+		}
+		return;
+	}
+
+	// Response done/completed — extract usage
+	if (EventType == TEXT("response.done") || EventType == TEXT("response.completed"))
+	{
+		const TSharedPtr<FJsonObject>* RespObj = nullptr;
+		if (Obj->TryGetObjectField(TEXT("response"), RespObj))
+		{
+			const TSharedPtr<FJsonObject>* UsageObj = nullptr;
+			if ((*RespObj)->TryGetObjectField(TEXT("usage"), UsageObj))
+			{
+				ExtractTokenUsage(*UsageObj);
+			}
+		}
+		return;
+	}
+
+	// Error event
+	if (EventType == TEXT("response.error") || EventType == TEXT("error"))
+	{
+		const TSharedPtr<FJsonObject>* ErrObj = nullptr;
+		FString ErrMsg;
+		if (Obj->TryGetObjectField(TEXT("error"), ErrObj))
+		{
+			(*ErrObj)->TryGetStringField(TEXT("message"), ErrMsg);
+		}
+		if (ErrMsg.IsEmpty()) Obj->TryGetStringField(TEXT("message"), ErrMsg);
+		if (!ErrMsg.IsEmpty())
+		{
+			UE_LOG(LogAutonomix, Error, TEXT("OpenAICompatClient: Responses API error: %s"), *ErrMsg);
+		}
+		return;
+	}
+
+	// Ignore: response.created, response.in_progress, response.queued, response.content_part.*
+}
+
+// ==========================================================================
+// Chat Completions API (legacy — DeepSeek, Mistral, xAI, Ollama, etc.)
+// ==========================================================================
+
+TSharedPtr<FJsonObject> FAutonomixOpenAICompatClient::BuildChatCompletionsBody(
+	const TArray<FAutonomixMessage>& History,
+	const FString& SystemPrompt,
+	const TArray<TSharedPtr<FJsonObject>>& ToolSchemas) const
+{
 	TSharedPtr<FJsonObject> Body = MakeShared<FJsonObject>();
 	Body->SetStringField(TEXT("model"), ModelId);
 	Body->SetNumberField(TEXT("max_tokens"), (double)MaxTokens);
 	Body->SetBoolField(TEXT("stream"), bStreamingEnabled);
+
+	// Opt in to streaming usage
+	if (bStreamingEnabled)
+	{
+		TSharedPtr<FJsonObject> StreamOpts = MakeShared<FJsonObject>();
+		StreamOpts->SetBoolField(TEXT("include_usage"), true);
+		Body->SetObjectField(TEXT("stream_options"), StreamOpts);
+	}
 
 	// Temperature: o-series models don't support temperature
 	bool bIsReasoningModel = (ReasoningEffort != EAutonomixReasoningEffort::Disabled);
@@ -568,9 +1263,38 @@ void FAutonomixOpenAICompatClient::HandleRequestComplete(
 
 	ConsecutiveRateLimits = 0;
 
-	// Process any remaining SSE data
-	FString Body = Response->GetContentAsString();
-	ProcessSSEChunk(Body);
+	// CRITICAL FIX: Do NOT re-process the full response body here.
+	// HandleRequestProgress() already processed all bytes incrementally via
+	// LastBytesReceived offset tracking. Calling ProcessSSEChunk(FullBody) would
+	// re-feed the entire response into SSELineBuffer, causing DOUBLED content
+	// and DOUBLED tool calls — the root cause of GitHub Issue #1 ("OpenAI doesn't work").
+	//
+	// Instead, only flush the remaining incomplete line buffer (the last partial
+	// line that didn't end with \n during streaming). This matches Roo Code's
+	// pattern where the stream iterator naturally delivers remaining data.
+	if (!SSELineBuffer.IsEmpty())
+	{
+		// Force-flush: treat remaining buffer as a complete line
+		FString Remaining = SSELineBuffer;
+		SSELineBuffer.Empty();
+		Remaining.TrimEndInline();
+		if (Remaining.StartsWith(TEXT("data: ")))
+		{
+			FString JsonData = Remaining.Mid(6).TrimStartAndEnd();
+			if (JsonData != TEXT("[DONE]") && !JsonData.IsEmpty())
+			{
+				// Must dispatch to the correct handler based on API type
+				if (bUseResponsesAPI)
+				{
+					ProcessResponsesSSEEvent(JsonData);
+				}
+				else
+				{
+					ProcessSSEEvent(JsonData);
+				}
+			}
+		}
+	}
 	FinalizeResponse();
 }
 
@@ -587,11 +1311,20 @@ void FAutonomixOpenAICompatClient::ProcessSSEChunk(const FString& RawData)
 		if (Line.StartsWith(TEXT("data: ")))
 		{
 			FString JsonData = Line.Mid(6).TrimStartAndEnd();
-			if (JsonData != TEXT("[DONE]"))
+			if (JsonData != TEXT("[DONE]") && !JsonData.IsEmpty())
 			{
-				ProcessSSEEvent(JsonData);
+				if (bUseResponsesAPI)
+				{
+					ProcessResponsesSSEEvent(JsonData);
+				}
+				else
+				{
+					ProcessSSEEvent(JsonData);
+				}
 			}
 		}
+		// Responses API may also send event: lines (SSE event field) — ignore them
+		// The actual data is in the "data:" lines
 	}
 }
 
@@ -682,11 +1415,22 @@ void FAutonomixOpenAICompatClient::ProcessSSEEvent(const FString& DataJson)
 void FAutonomixOpenAICompatClient::ExtractTokenUsage(const TSharedPtr<FJsonObject>& UsageObj)
 {
 	if (!UsageObj.IsValid()) return;
-	double Prompt = 0, Completion = 0;
-	UsageObj->TryGetNumberField(TEXT("prompt_tokens"), Prompt);
-	UsageObj->TryGetNumberField(TEXT("completion_tokens"), Completion);
-	LastTokenUsage.InputTokens = (int32)Prompt;
-	LastTokenUsage.OutputTokens = (int32)Completion;
+
+	// Ported from Roo Code openai-native.ts normalizeUsage():
+	// Chat Completions API uses: prompt_tokens / completion_tokens
+	// Responses API uses:        input_tokens / output_tokens
+	// Handle both formats with fallback.
+	double Input = 0, Output = 0;
+	if (!UsageObj->TryGetNumberField(TEXT("input_tokens"), Input))
+	{
+		UsageObj->TryGetNumberField(TEXT("prompt_tokens"), Input);
+	}
+	if (!UsageObj->TryGetNumberField(TEXT("output_tokens"), Output))
+	{
+		UsageObj->TryGetNumberField(TEXT("completion_tokens"), Output);
+	}
+	LastTokenUsage.InputTokens = (int32)Input;
+	LastTokenUsage.OutputTokens = (int32)Output;
 	TokenUsageUpdatedDelegate.Broadcast(LastTokenUsage);
 }
 
